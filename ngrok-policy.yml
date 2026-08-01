@@ -1,0 +1,10 @@
+on_http_request:
+  - actions:
+      - type: rate-limit
+        config:
+          name: mcp-requests-per-ip
+          algorithm: sliding_window
+          capacity: 120
+          rate: 60s
+          bucket_key:
+            - conn.client_ip

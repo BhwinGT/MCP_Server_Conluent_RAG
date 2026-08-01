@@ -1,0 +1,13 @@
+httpx==0.28.1
+beautifulsoup4==4.15.0
+qdrant-client==1.18.0
+fastembed==0.8.0
+mcp==1.29.0
+# Standalone FastMCP -- provides the OAuth machinery (AzureProvider, built
+# on OAuthProxy) that the `mcp` SDK's bundled FastMCP 1.0 does not have.
+# Both packages are needed: qdrant_server.py uses fastmcp for the SERVER,
+# orchestrator.py uses mcp for its CLIENT.
+fastmcp==3.4.5
+ollama==0.6.2
+python-dotenv==1.2.2
+tqdm==4.70.0

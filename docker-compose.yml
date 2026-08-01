@@ -1,0 +1,174 @@
+# -----------------------------------------------------------------------
+# Confluent Support RAG -- full stack
+# -----------------------------------------------------------------------
+# Always-on services (start with `docker compose up -d`):
+#   qdrant        -- vector database, stores embedded support articles
+#   ollama        -- serves the local embedding model (and local inference
+#                     if OLLAMA_API_KEY is left blank in .env)
+#   ollama_init   -- one-shot, pulls the embedding model then exits
+#   mcp_server    -- the MCP server Claude Desktop / other clients connect to
+#   ngrok         -- public HTTPS URL via ngrok's free static domain
+#
+# Opt-in profiles (NOT started by a bare `docker compose up`):
+#   cloudflared   -- public HTTPS URL via Cloudflare Tunnel (needs a domain):
+#                     docker compose --profile cloudflare up -d
+#   ingestion     -- scrapes the support portal and embeds new content
+#   orchestrator  -- interactive terminal Q&A, mainly for testing
+#
+# The `tools` profile services are one-off commands, not daemons, always run them with `--rm` so they don't accumulate as stopped containers.
+# -----------------------------------------------------------------------
+
+services:
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: confluent-rag-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: confluent-rag-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  ollama_init:
+    image: ollama/ollama:latest
+    container_name: confluent-rag-ollama-init
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["ollama pull ${EMBED_MODEL:-qwen3-embedding:0.6b}"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+  mcp_server:
+    build: .
+    container_name: confluent-rag-mcp-server
+    restart: unless-stopped
+    command: ["python", "mcp_server/qdrant_server.py"]
+    env_file:
+      - .env
+    environment:
+      QDRANT_HOST: qdrant
+      OLLAMA_HOST: http://ollama:11434
+      MCP_HOST: 0.0.0.0
+      FASTEMBED_CACHE_DIR: /app/model_cache
+    ports:
+      - "8000:8000"
+    volumes:
+      - model_cache:/app/model_cache
+      - oauth_state:/root/.local/share/fastmcp
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import socket; socket.create_connection(('127.0.0.1', 8000), 3).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
+    depends_on:
+      qdrant:
+        condition: service_started
+      ollama:
+        condition: service_healthy
+      ollama_init:
+        condition: service_completed_successfully
+
+  # Run manually(scrape Confluent):     docker compose run --rm ingestion python ingest/scrape_support.py
+  # Run manually(add new chunks):       docker compose run --rm ingestion python ingest/embed_store.py
+  # Run manually(re-embed everything):  docker compose run --rm ingestion python ingest/embed_store.py --reset
+  ingestion:
+    build: .
+    container_name: confluent-rag-ingestion
+    profiles: ["tools"]
+    env_file:
+      - .env
+    environment:
+      QDRANT_HOST: qdrant
+      OLLAMA_HOST: http://ollama:11434
+      FASTEMBED_CACHE_DIR: /app/model_cache
+    volumes:
+      - model_cache:/app/model_cache
+      - ./ingest:/app/ingest
+    depends_on:
+      qdrant:
+        condition: service_started
+      ollama:
+        condition: service_healthy
+
+  # Run manually: docker compose run --rm -it orchestrator
+  # For quick manual testing without a full MCP client.
+  orchestrator:
+    build: .
+    container_name: confluent-rag-orchestrator
+    profiles: ["tools"]
+    command: ["python", "rag/orchestrator.py"]
+    env_file:
+      - .env
+    environment:
+      QDRANT_HOST: qdrant
+      OLLAMA_HOST: http://ollama:11434
+      MCP_HOST: mcp_server
+    stdin_open: true
+    tty: true
+    depends_on:
+      mcp_server:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------
+  # Public HTTPS access. Pick one of the two services below
+  #
+  # Both replace the manual `ngrok http 8000` terminal step: as compose
+  # services with restart: unless-stopped.
+  # ---------------------------------------------------------------------
+
+  # Option A -- ngrok. Free tier includes one STATIC domain, so the URL is
+  # stable across restarts. Quotas: 20k requests + 1GB transfer per month.
+  #     starts automatically with docker compose up -d
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: confluent-rag-ngrok
+    # profiles: ["ngrok"]
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command: ['ngrok http mcp_server:8000 --traffic-policy-file=/etc/ngrok-policy.yml $${NGROK_DOMAIN:+--url=https://$$NGROK_DOMAIN}']
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
+      NGROK_DOMAIN: ${NGROK_DOMAIN:-}
+    volumes:
+      - ./ngrok-policy.yml:/etc/ngrok-policy.yml:ro
+    depends_on:
+      mcp_server:
+        condition: service_healthy
+
+  # Option B -- Cloudflare Tunnel. Needs a domain on Cloudflare, but has no
+  # request/bandwidth quota and supports free auth via Cloudflare Access.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: confluent-rag-cloudflared
+    profiles: ["cloudflare"]
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      mcp_server:
+        condition: service_healthy
+
+volumes:
+  qdrant_storage:
+  ollama_data:
+  model_cache:
+  oauth_state:

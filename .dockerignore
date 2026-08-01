@@ -1,0 +1,13 @@
+.env
+*.env
+.git
+.gitignore
+
+__pycache__/
+*.pyc
+.venv/
+
+ingest/fetched_docs.json
+model_cache/
+
+README.md
